@@ -1,0 +1,51 @@
+services:
+  gargantua:
+    build: .
+    image: gargantua:latest
+    container_name: gargantua
+    # Recommended: route through a Gluetun (or other) VPN container.
+    # network_mode: "container:gluetun"
+
+    # sldl is shipped only as linux/amd64. On arm64 hosts (Apple Silicon,
+    # Raspberry Pi 5...) Docker will run it through QEMU.
+    platform: linux/amd64
+
+    # `tty: true` keeps colours and the live progress UI rendering correctly
+    # even when run with `docker compose up` (no attached terminal).
+    tty: true
+
+#    environment:
+      # All env vars are optional. If SLSK_USERNAME / SLSK_PASSWORD are unset,
+      # a throwaway Soulseek identity is generated on the fly: connecting with
+      # a fresh username on Soulseek transparently creates the account.
+      # SLSK_USERNAME: ""
+      # SLSK_PASSWORD: ""
+
+      # Pick one input source. If none is set, gargantua looks for a
+      # playlist.txt then playlist.csv in /data, and finally any *.txt / *.csv.
+      #
+      # 1. URL — Spotify, YouTube, Bandcamp, MusicBrainz (sldl auto-detects):
+      # PLAYLIST_URL: "https://www.youtube.com/playlist?list=<id>"
+      # Spotify URLs additionally require app credentials since 2024
+      # (free at https://developer.spotify.com):
+      # SPOTIFY_ID: ""
+      # SPOTIFY_SECRET: ""
+      #
+      # 2. Plain text file — one search query per line, dropped in /data:
+      # TXT_FILENAME: "playlist.txt"
+      #
+      # 3. CSV file — see sldl docs for column names:
+      # CSV_FILENAME: "playlist.csv"
+
+      # Tuning knobs (defaults shown).
+      # PREF_FORMAT: "flac"
+      # NAME_FORMAT: "{artist( - )title|filename}"
+      # CONCURRENT_DOWNLOADS: "4"
+      # STRICT_CONDITIONS: "false"
+      # FAST_SEARCH: "true"
+      # WRITE_PLAYLIST: "true"
+      # SLDL_EXTRA_ARGS: ""
+
+    volumes:
+      - ./${DATA_FOLDER:-ma_playlist}:/data
+      - ./downloads:/downloads

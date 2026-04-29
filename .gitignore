@@ -1,0 +1,6 @@
+.DS_Store
+__MACOSX
+data/
+downloads/
+__pycache__/
+*.pyc
