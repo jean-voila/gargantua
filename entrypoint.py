@@ -2,6 +2,7 @@
 """Gargantua entrypoint: Soulseek bulk downloader on top of sldl with a rich TUI."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -10,11 +11,14 @@ import signal
 import string
 import subprocess
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
 
 from rich.align import Align
 from rich.console import Console, Group
@@ -36,6 +40,38 @@ DOWNLOADS_DIR = Path("/downloads")
 LOG_FILE = DATA_DIR / "sldl.log"
 INDEX_PATH = DATA_DIR / "index.sldl"
 CREDENTIALS_FILE = DATA_DIR / "credentials.txt"
+MB_CACHE_FILE = DATA_DIR / "mb_cache.json"
+
+MB_API = "https://musicbrainz.org/ws/2/recording/"
+MB_USER_AGENT = "gargantua/1.0 ( https://github.com/jean-voila/gargantua )"
+MB_RATE_LIMIT_SECONDS = 1.0
+MB_DEFAULT_MIN_SCORE = 85
+
+# Tags routinely appended to YouTube video titles that have nothing to do with
+# the actual recording — they break exact-string searches on Soulseek (e.g.
+# "Supertramp - Gone Hollywood (Official Audio)" yields zero hits because no
+# user names their FLAC files that way).
+_NOISE_PATTERNS = [
+    r"official\s*(?:music\s*)?(?:audio|video|lyric\s*video|lyrics?\s*video)",
+    r"official",
+    r"lyric\s*video",
+    r"lyrics(?:\s*video)?",
+    r"audio(?:\s*only)?",
+    r"video",
+    r"music\s*video",
+    r"hd|hq|4k|1080p?|720p?|480p?",
+    r"remastered(?:\s*\d{4})?",
+    r"\d{4}\s*remaster(?:ed)?",
+    r"full\s*album",
+    r"visualizer",
+    r"clip\s*officiel",
+    r"audio\s*officiel",
+    r"vid[eé]o\s*officielle",
+]
+NOISE_RE = re.compile(
+    r"\s*[\(\[]\s*(?:" + "|".join(_NOISE_PATTERNS) + r")\s*[\)\]]",
+    re.IGNORECASE,
+)
 
 ASCII_BANNER = r"""
    ____                              _
@@ -201,6 +237,251 @@ def _yt_dlp_title(video_id: str) -> str:
     return title
 
 
+def _yt_dlp_playlist_titles(url: str) -> list[str]:
+    """Return the list of video titles in a YouTube playlist via yt-dlp.
+    Uses ``--flat-playlist`` so we don't fetch each video's full metadata."""
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp", "--flat-playlist", "--no-warnings",
+                "--print", "%(title)s", url,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except FileNotFoundError:
+        console.print("[red]error:[/] yt-dlp is not installed in the container.")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        console.print(f"[red]error:[/] yt-dlp timed out fetching playlist {url}.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        console.print(f"[red]error:[/] yt-dlp failed to fetch playlist {url}.")
+        if stderr:
+            console.print(Text(stderr, style="dim"))
+        sys.exit(1)
+    titles = [t.strip() for t in (result.stdout or "").splitlines() if t.strip()]
+    if not titles:
+        console.print(f"[red]error:[/] no titles found in playlist {url}.")
+        sys.exit(1)
+    return titles
+
+
+def _is_youtube_playlist(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = parsed.netloc.lower()
+    if "youtube.com" not in host and "youtu.be" not in host:
+        return False
+    qs = parse_qs(parsed.query)
+    return bool(qs.get("list")) or parsed.path == "/playlist"
+
+
+def _clean_youtube_title(title: str) -> str:
+    """Strip the noise tags YouTube uploaders append to titles
+    (``(Official Audio)``, ``[Lyrics]``, ``(Remastered 2009)`` …) so the result
+    is usable as a Soulseek search query. Only touches content inside ``()`` /
+    ``[]`` to avoid mangling actual words in the title."""
+    cleaned = NOISE_RE.sub("", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—")
+    return cleaned or title.strip()
+
+
+# ---------- MusicBrainz lookup ----------------------------------------------
+
+_mb_last_request: float = 0.0
+
+
+def _load_mb_cache() -> dict[str, list[str]]:
+    """Load the MusicBrainz cache from /data. Hits only — misses are not
+    persisted so MB additions become visible on the next run."""
+    if not MB_CACHE_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(MB_CACHE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: list(v) for k, v in raw.items() if isinstance(v, list) and len(v) == 2}
+
+
+def _save_mb_cache(cache: dict[str, list[str]]) -> None:
+    try:
+        MB_CACHE_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+_LUCENE_SPECIAL_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)')
+
+
+def _lucene_escape(s: str) -> str:
+    """Escape characters that Lucene treats as operators in MB queries."""
+    return _LUCENE_SPECIAL_RE.sub(r"\\\1", s)
+
+
+def _split_artist_title(cleaned: str) -> tuple[str | None, str | None]:
+    """Split a cleaned YouTube title on the first `` - `` (or its em/en-dash
+    variants) into ``(artist, title)``. Returns ``(None, None)`` if no
+    separator is present."""
+    for sep in (" - ", " – ", " — "):
+        if sep in cleaned:
+            artist, _, title = cleaned.partition(sep)
+            artist = artist.strip()
+            title = title.strip()
+            if artist and title:
+                return artist, title
+            return None, None
+    return None, None
+
+
+def _credit_to_artist(credits: list[dict]) -> str:
+    return "".join(
+        (c.get("name") or (c.get("artist") or {}).get("name") or "")
+        + (c.get("joinphrase") or "")
+        for c in credits
+    ).strip()
+
+
+def _mb_query(raw_title: str, min_score: int) -> tuple[str, str] | None:
+    """Query MusicBrainz for the recording best matching ``raw_title``. Returns
+    ``(artist, title)`` if a confident hit is found, else None.
+
+    YouTube titles of the form ``Artist - Title`` are queried with a structured
+    Lucene query (``recording:"…" AND artist:"…"``) so MB doesn't return
+    covers/tributes ranked 100 because the title alone matches. Without an
+    artist hint we skip the lookup entirely — top-scored unstructured matches
+    are too unreliable to feed into Soulseek search.
+
+    Enforces the 1 req/s anonymous rate limit. Network/parse failures return
+    None so the caller can fall back to the cleaned YouTube title."""
+    cleaned = _clean_youtube_title(raw_title)
+    artist_hint, title_hint = _split_artist_title(cleaned)
+    if not artist_hint or not title_hint:
+        return None
+
+    global _mb_last_request
+    elapsed = time.monotonic() - _mb_last_request
+    if elapsed < MB_RATE_LIMIT_SECONDS:
+        time.sleep(MB_RATE_LIMIT_SECONDS - elapsed)
+
+    lucene = (
+        f'recording:"{_lucene_escape(title_hint)}"'
+        f' AND artist:"{_lucene_escape(artist_hint)}"'
+    )
+    url = f"{MB_API}?query={quote(lucene)}&fmt=json&limit=10"
+    req = Request(url, headers={"User-Agent": MB_USER_AGENT, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    finally:
+        _mb_last_request = time.monotonic()
+
+    recordings = data.get("recordings") or []
+    if not recordings:
+        return None
+
+    # Re-rank: real artist match wins over score, then score breaks ties. This
+    # handles the "Logical Song [Supertramp]" cover case — MB ranks the cover
+    # at 100, but its artist field doesn't contain "Supertramp", so it loses.
+    artist_hint_low = artist_hint.lower()
+
+    def _rank(rec: dict) -> tuple[int, int]:
+        score = int(rec.get("score") or 0)
+        artist = _credit_to_artist(rec.get("artist-credit") or []).lower()
+        return (1 if artist_hint_low in artist else 0, score)
+
+    recordings.sort(key=_rank, reverse=True)
+    best = recordings[0]
+    score = int(best.get("score") or 0)
+    if score < min_score:
+        return None
+    title = (best.get("title") or "").strip()
+    credits = best.get("artist-credit") or []
+    if not title or not credits:
+        return None
+    artist = _credit_to_artist(credits)
+    if not artist:
+        return None
+    # Final guard: if the chosen artist doesn't contain the hint at all, the
+    # match is a tribute / cover / unrelated recording — drop it.
+    if artist_hint_low not in artist.lower():
+        return None
+    return artist, title
+
+
+def _resolve_title(
+    raw_title: str,
+    cache: dict[str, list[str]],
+    min_score: int,
+    enable_mb: bool,
+) -> tuple[str, str]:
+    """Return ``(query, source)`` for ``raw_title``. ``source`` is either
+    ``"musicbrainz"`` (canonical artist - title) or ``"cleaned"`` (YouTube
+    title with noise tags stripped). Cache hits never re-query MB."""
+    if enable_mb:
+        hit = cache.get(raw_title)
+        if hit is not None:
+            return f"{hit[0]} - {hit[1]}", "musicbrainz"
+        result = _mb_query(raw_title, min_score)
+        if result is not None:
+            cache[raw_title] = [result[0], result[1]]
+            return f"{result[0]} - {result[1]}", "musicbrainz"
+    return _clean_youtube_title(raw_title), "cleaned"
+
+
+def _build_resolved_list(titles: list[str]) -> tuple[Path, int, int]:
+    """Resolve each YouTube title via MusicBrainz (with rate-limited HTTP and a
+    persistent cache) and write a sldl ``.list`` file. Returns the file path,
+    the count resolved via MB, and the count that fell back to cleaned YT
+    titles."""
+    enable_mb = env_bool("MB_LOOKUP", True)
+    min_score = env_int("MB_MIN_SCORE", MB_DEFAULT_MIN_SCORE)
+    cache = _load_mb_cache() if enable_mb else {}
+
+    out = DATA_DIR / "youtube_resolved.list"
+    lines: list[str] = []
+    mb_hits = 0
+    fallback = 0
+
+    progress = Progress(
+        SpinnerColumn(style="magenta"),
+        TextColumn("[bold cyan]resolving titles via MusicBrainz"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    )
+    task_id = progress.add_task("resolving", total=len(titles))
+    with progress:
+        for raw in titles:
+            query, source = _resolve_title(raw, cache, min_score, enable_mb)
+            if source == "musicbrainz":
+                mb_hits += 1
+            else:
+                fallback += 1
+            escaped = query.replace('"', '\\"')
+            lines.append(f'"{escaped}"')
+            progress.update(task_id, advance=1)
+
+    if enable_mb:
+        _save_mb_cache(cache)
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out, mb_hits, fallback
+
+
 def _txt_to_list_file(src: Path) -> Path:
     """Convert a plain `.txt` (one search query per line) into a sldl `.list` file
     by quoting each non-empty, non-comment line. The result is stored in /data so
@@ -266,21 +547,54 @@ def parse_cli(argv: list[str]) -> tuple[str | None, bool]:
 
 
 def _resolve_youtube_url(url: str) -> tuple[str, str, str | None, bool]:
-    """If ``url`` is a single-video YouTube URL, fetch the title via yt-dlp and
-    return it as a sldl ``string`` input. Otherwise return the URL untouched.
-    The 4th tuple element is True iff the original input came from YouTube."""
+    """For YouTube URLs, fetch titles via yt-dlp and resolve each through
+    MusicBrainz (with cleaned-title fallback) so sldl gets canonical
+    ``Artist - Title`` queries instead of noisy YouTube strings.
+
+    Single videos become sldl ``string`` inputs; playlists become a generated
+    ``.list`` file in /data. Non-YouTube URLs are returned untouched. The 4th
+    tuple element is True iff the original input came from YouTube."""
     video_id = _youtube_video_id(url)
-    if video_id is None:
-        is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
-        return url, _label_for_url(url), None, is_yt
-    console.print(
-        f"[cyan]Single-video YouTube URL detected[/] (id={video_id}); "
-        "fetching title with yt-dlp…"
-    )
-    title = _yt_dlp_title(video_id)
-    console.print(f"[green]→ search query:[/] {title}")
-    label = f"YouTube video ({title})"
-    return title, label, "string", True
+    if video_id is not None:
+        console.print(
+            f"[cyan]Single-video YouTube URL detected[/] (id={video_id}); "
+            "fetching title with yt-dlp…"
+        )
+        raw_title = _yt_dlp_title(video_id)
+        enable_mb = env_bool("MB_LOOKUP", True)
+        min_score = env_int("MB_MIN_SCORE", MB_DEFAULT_MIN_SCORE)
+        cache = _load_mb_cache() if enable_mb else {}
+        query, source = _resolve_title(raw_title, cache, min_score, enable_mb)
+        if enable_mb and source == "musicbrainz":
+            _save_mb_cache(cache)
+        tag = "MusicBrainz" if source == "musicbrainz" else "cleaned title"
+        console.print(f"[green]→ search query[/] ([dim]{tag}[/]): {query}")
+        label = f"YouTube video ({raw_title})"
+        return query, label, "string", True
+
+    if _is_youtube_playlist(url):
+        console.print(
+            f"[cyan]YouTube playlist detected[/] ({url}); fetching titles with yt-dlp…"
+        )
+        titles = _yt_dlp_playlist_titles(url)
+        console.print(
+            f"[green]→ {len(titles)} videos[/]; resolving via MusicBrainz "
+            f"(rate-limited at 1 req/s — first run takes ~{len(titles)}s)…"
+        )
+        list_file, mb_hits, fallback = _build_resolved_list(titles)
+        console.print(
+            f"[green]→ resolved:[/] {mb_hits} via MusicBrainz, "
+            f"{fallback} via cleaned YouTube title fallback "
+            f"([dim]{list_file}[/])"
+        )
+        label = (
+            f"YouTube playlist ({url}, {len(titles)} tracks, "
+            f"{mb_hits} MB / {fallback} fallback)"
+        )
+        return str(list_file), label, "list", True
+
+    is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    return url, _label_for_url(url), None, is_yt
 
 
 def resolve_input(cli_url: str | None) -> tuple[str, str, str | None, bool]:

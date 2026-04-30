@@ -84,7 +84,7 @@ When credentials are auto-generated they are written to `/data/credentials.txt`
 
 | Variable        | Description                                                      |
 | --------------- | ---------------------------------------------------------------- |
-| `PLAYLIST_URL`  | Spotify, YouTube, Bandcamp or MusicBrainz playlist URL — or a single YouTube video URL (`watch?v=`, `youtu.be/<id>`, `shorts/<id>`), in which case yt-dlp fetches the title and passes it to sldl as a search query. sldl auto-detects the type. |
+| `PLAYLIST_URL`  | Spotify, YouTube, Bandcamp or MusicBrainz playlist URL — or a single YouTube video URL (`watch?v=`, `youtu.be/<id>`, `shorts/<id>`). For YouTube inputs, gargantua fetches the title(s) with yt-dlp and resolves each through the [MusicBrainz](https://musicbrainz.org) API to get a canonical `Artist - Title` query, falling back to a cleaned YouTube title (noise tags like `(Official Audio)` / `[Lyrics]` stripped) when MusicBrainz has no confident match. sldl auto-detects the type for non-YouTube URLs. |
 | `TXT_FILENAME`  | Plain text file in `/data`, **one search query per line**. Falls back to `playlist.txt` then to the first `*.txt` found. Lines starting with `#` are comments. Prefix `a:` for an album download. Gargantua wraps each line in quotes and feeds it to sldl as a `--input-type=list`. |
 | `CSV_FILENAME`  | CSV file in `/data`. Falls back to `playlist.csv` then to the first `*.csv` found. |
 | `SPOTIFY_ID` / `SPOTIFY_SECRET` | Spotify API client credentials. **Required for Spotify URLs** since Spotify deprecated anonymous playlist access in 2024 (free, from [developer.spotify.com](https://developer.spotify.com)). |
@@ -113,6 +113,8 @@ https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | `FAST_SEARCH`          | `true`                           | `--fast-search`           |
 | `WRITE_PLAYLIST`       | `true`                           | `--write-playlist`        |
 | `YOUTUBE_TITLE_FALLBACK` | `true`                         | (gargantua-side) for YouTube playlists, retries any track that wasn't found using just the video title — without the `Artist -` prefix that sldl extracts from the video name. |
+| `MB_LOOKUP`            | `true`                           | (gargantua-side) resolve YouTube titles through MusicBrainz before searching Soulseek. Disable to skip the network calls and use only the cleaned YouTube title. |
+| `MB_MIN_SCORE`         | `85`                             | (gargantua-side) minimum MusicBrainz match score (0–100) to accept a hit. Lower = more permissive but more wrong matches; higher = stricter, more fallbacks to cleaned YouTube titles. |
 | `MINIMAL`              | `false`                          | (gargantua-side) terse output: a single startup line, one progress bar, one line per completed track, one summary line. No banners, panels, or rules. Equivalent to `-m` / `--minimal` on the CLI. |
 | `SLDL_EXTRA_ARGS`      | *(empty)*                        | passed verbatim to sldl   |
 
@@ -126,6 +128,8 @@ https://www.youtube.com/watch?v=dQw4w9WgXcQ
 * **sldl index** at `/data/index.sldl`
 * **m3u playlist** alongside downloads when `WRITE_PLAYLIST=true`
 * **Auto-generated credentials** (if applicable) at `/data/credentials.txt`
+* **MusicBrainz lookup cache** at `/data/mb_cache.json` (only successful matches are persisted; delete the file to force re-resolution)
+* **Resolved playlist** at `/data/youtube_resolved.list` for YouTube playlist runs, listing the exact queries fed to sldl
 
 ## Architecture note
 
