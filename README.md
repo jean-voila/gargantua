@@ -15,7 +15,7 @@ track in your preferred quality.
 Build once, then run with the playlist URL as a positional argument:
 
 ```bash
-git clone git@github.com:jean-voila/FeurStagram.git && cd gargantua
+git clone git@github.com:jean-voila/gargantua.git && cd gargantua
 docker build -t gargantua .
 docker run --rm -it \
   -v "$PWD/data:/data" \
@@ -26,7 +26,7 @@ docker run --rm -it \
 For Spotify URLs, add your credentials:
 
 ```bash
-git clone git@github.com:jean-voila/FeurStagram.git && cd gargantua
+git clone git@github.com:jean-voila/gargantua.git && cd gargantua
 docker run --rm -it \
   -e SPOTIFY_ID=... \
   -e SPOTIFY_SECRET=... \
