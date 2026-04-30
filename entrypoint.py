@@ -14,6 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qs, urlparse
 
 from rich.align import Align
 from rich.console import Console, Group
@@ -67,6 +68,8 @@ class Config:
     spotify_secret: str
     input_type: str | None = None
     extra_args: list[str] = field(default_factory=list)
+    youtube_origin: bool = False
+    minimal: bool = False
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -112,6 +115,22 @@ def _find_in_data(env_name: str, suffix: str, preferred: str) -> Path | None:
     return matches[0] if matches else None
 
 
+_URL_SHELL_ESCAPE_RE = re.compile(r"\\([?=&#!*'()\[\] ])")
+
+
+def _clean_url(url: str) -> str:
+    """Strip shell-escape backslashes (e.g. ``\\?``, ``\\=``) that users sometimes
+    leave inside double-quoted URLs when copying from a zsh-style command line.
+    Raw backslashes aren't valid in URLs, so this is a safe normalization."""
+    cleaned = _URL_SHELL_ESCAPE_RE.sub(r"\1", url)
+    if cleaned != url:
+        console.print(
+            f"[yellow]warning:[/] stripped shell-escape backslashes from URL "
+            f"(received {url!r}, using {cleaned!r})."
+        )
+    return cleaned
+
+
 def _label_for_url(url: str) -> str:
     lower = url.lower()
     if "spotify.com" in lower:
@@ -123,6 +142,63 @@ def _label_for_url(url: str) -> str:
     if "musicbrainz.org" in lower:
         return f"MusicBrainz ({url})"
     return f"URL ({url})"
+
+
+def _youtube_video_id(url: str) -> str | None:
+    """Return the YouTube video ID if ``url`` points to a single video (``watch``,
+    ``shorts``, or ``youtu.be``) and is *not* a playlist (``list=``). Returns None
+    for playlists or non-YouTube URLs."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = parsed.netloc.lower()
+    if "youtube.com" not in host and "youtu.be" not in host:
+        return None
+    qs = parse_qs(parsed.query)
+    if qs.get("list"):
+        return None
+    if "youtu.be" in host:
+        vid = parsed.path.lstrip("/").split("/", 1)[0]
+        return vid or None
+    if parsed.path == "/watch":
+        return (qs.get("v") or [None])[0]
+    if parsed.path.startswith("/shorts/"):
+        parts = parsed.path.split("/")
+        return parts[2] if len(parts) >= 3 and parts[2] else None
+    return None
+
+
+def _yt_dlp_title(video_id: str) -> str:
+    """Fetch the title of a YouTube video via yt-dlp. Exits the process on
+    failure with a clear message, since without a title we have nothing to
+    search for."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--skip-download", "--no-warnings", "--print", "title", url],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        console.print("[red]error:[/] yt-dlp is not installed in the container.")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        console.print(f"[red]error:[/] yt-dlp timed out fetching metadata for {url}.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        console.print(f"[red]error:[/] yt-dlp failed to fetch metadata for {url}.")
+        if stderr:
+            console.print(Text(stderr, style="dim"))
+        sys.exit(1)
+    title = result.stdout.strip().splitlines()[0].strip() if result.stdout else ""
+    if not title:
+        console.print(f"[red]error:[/] yt-dlp returned an empty title for {url}.")
+        sys.exit(1)
+    return title
 
 
 def _txt_to_list_file(src: Path) -> Path:
@@ -151,20 +227,79 @@ def _txt_to_list_file(src: Path) -> Path:
     return out
 
 
-def resolve_input() -> tuple[str, str, str | None]:
-    """Returns (input_arg, human_label, input_type_override)."""
+def parse_cli_playlist(argv: list[str]) -> str | None:
+    if not argv:
+        return None
+    first = argv[0].strip()
+    if first in {"-h", "--help"}:
+        console.print("Usage: gargantua [-m|--minimal] <playlist-url>")
+        console.print("Alternatively set PLAYLIST_URL or drop a .txt/.csv in /data.")
+        sys.exit(0)
+    if first in {"--playlist-url", "--url"}:
+        if len(argv) < 2 or not argv[1].strip():
+            console.print("[red]error:[/] --playlist-url expects a value.")
+            sys.exit(2)
+        if len(argv) > 2:
+            extra = " ".join(argv[2:])
+            console.print(f"[yellow]warning:[/] extra arguments ignored: {extra}")
+        return _clean_url(argv[1].strip())
+    if first.startswith("-"):
+        console.print(f"[red]error:[/] unknown option {first!r}.")
+        sys.exit(2)
+    if len(argv) > 1:
+        extra = " ".join(argv[1:])
+        console.print(f"[yellow]warning:[/] extra arguments ignored: {extra}")
+    return _clean_url(first)
+
+
+def parse_cli(argv: list[str]) -> tuple[str | None, bool]:
+    """Strips ``--minimal`` / ``-m`` flags from argv and delegates the rest to
+    ``parse_cli_playlist``. Returns ``(url_or_None, minimal_flag)``."""
+    minimal = False
+    rest: list[str] = []
+    for token in argv:
+        if token in {"-m", "--minimal"}:
+            minimal = True
+        else:
+            rest.append(token)
+    return parse_cli_playlist(rest), minimal
+
+
+def _resolve_youtube_url(url: str) -> tuple[str, str, str | None, bool]:
+    """If ``url`` is a single-video YouTube URL, fetch the title via yt-dlp and
+    return it as a sldl ``string`` input. Otherwise return the URL untouched.
+    The 4th tuple element is True iff the original input came from YouTube."""
+    video_id = _youtube_video_id(url)
+    if video_id is None:
+        is_yt = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+        return url, _label_for_url(url), None, is_yt
+    console.print(
+        f"[cyan]Single-video YouTube URL detected[/] (id={video_id}); "
+        "fetching title with yt-dlp…"
+    )
+    title = _yt_dlp_title(video_id)
+    console.print(f"[green]→ search query:[/] {title}")
+    label = f"YouTube video ({title})"
+    return title, label, "string", True
+
+
+def resolve_input(cli_url: str | None) -> tuple[str, str, str | None, bool]:
+    """Returns (input_arg, human_label, input_type_override, youtube_origin)."""
+    if cli_url:
+        return _resolve_youtube_url(cli_url)
     url = (os.environ.get("PLAYLIST_URL") or os.environ.get("SPOTIFY_LINK") or "").strip()
     if url:
-        return url, _label_for_url(url), None
+        url = _clean_url(url)
+        return _resolve_youtube_url(url)
 
     txt = _find_in_data("TXT_FILENAME", ".txt", "playlist.txt")
     if txt is not None:
         list_file = _txt_to_list_file(txt)
-        return str(list_file), f"text list ({txt.name}, {sum(1 for l in list_file.read_text().splitlines() if l.strip() and not l.lstrip().startswith('#'))} entries)", "list"
+        return str(list_file), f"text list ({txt.name}, {sum(1 for l in list_file.read_text().splitlines() if l.strip() and not l.lstrip().startswith('#'))} entries)", "list", False
 
     csv_path = _find_in_data("CSV_FILENAME", ".csv", "playlist.csv")
     if csv_path is not None:
-        return str(csv_path), f"CSV file ({csv_path.name})", None
+        return str(csv_path), f"CSV file ({csv_path.name})", None, False
 
     console.print(
         "[red]error:[/] no input found. Set [bold]PLAYLIST_URL[/] (Spotify / YouTube / "
@@ -197,9 +332,9 @@ def resolve_credentials() -> tuple[str, str, bool]:
     return user, pwd, True
 
 
-def load_config() -> Config:
+def load_config(cli_url: str | None, minimal_cli: bool = False) -> Config:
     user, pwd, generated = resolve_credentials()
-    src, label, input_type = resolve_input()
+    src, label, input_type, youtube_origin = resolve_input(cli_url)
     return Config(
         username=user,
         password=pwd,
@@ -207,6 +342,7 @@ def load_config() -> Config:
         input_source=src,
         input_label=label,
         input_type=input_type,
+        youtube_origin=youtube_origin,
         pref_format=os.environ.get("PREF_FORMAT") or os.environ.get("FORMAT") or "flac",
         name_format=os.environ.get("NAME_FORMAT") or "{artist( - )title|filename}",
         concurrent_downloads=env_int("CONCURRENT_DOWNLOADS", 4),
@@ -216,6 +352,7 @@ def load_config() -> Config:
         spotify_id=(os.environ.get("SPOTIFY_ID") or "").strip(),
         spotify_secret=(os.environ.get("SPOTIFY_SECRET") or "").strip(),
         extra_args=shlex.split(os.environ.get("SLDL_EXTRA_ARGS", "")),
+        minimal=minimal_cli or env_bool("MINIMAL", False),
     )
 
 
@@ -306,6 +443,7 @@ class RunState:
     in_progress: dict[str, str] = field(default_factory=dict)
     recent: deque = field(default_factory=lambda: deque(maxlen=12))
     last_log: deque = field(default_factory=lambda: deque(maxlen=4))
+    failed_tracks: list[str] = field(default_factory=list)
 
     @property
     def done(self) -> int:
@@ -419,6 +557,7 @@ def parse_line(line: str, state: RunState, progress: Progress, task_id) -> None:
         state.in_progress.pop(track, None)
         state.failed += 1
         state.recent.append(("failed", track))
+        state.failed_tracks.append(m.group(1).strip())
         progress.update(task_id, completed=state.done)
         return
 
@@ -479,18 +618,56 @@ def build_command(cfg: Config) -> list[str]:
     return cmd
 
 
-def stream_subprocess(cmd: Iterable[str]) -> tuple[int, RunState]:
+def parse_line_minimal(line: str, state: RunState, progress: Progress, task_id) -> None:
+    """Stripped-down event parser for minimal mode: only updates counters,
+    progress, and prints one line per terminal event (succeeded/failed/skipped).
+    No in-flight tracking, no recent buffer, no panels."""
+    stripped = line.strip()
+    if not stripped:
+        return
+    state.last_log.append(stripped)
+
+    if state.total is None and (m := RX_TRACK_TOTAL.match(stripped)):
+        try:
+            value = int(m.group(1))
+            if value > 0:
+                state.total = value
+                progress.update(task_id, total=value)
+        except ValueError:
+            pass
+        return
+
+    if RX_LOGIN_FAIL.search(stripped):
+        return
+
+    if (m := RX_SUCCESS.match(stripped)):
+        track = m.group(1).strip()
+        state.succeeded += 1
+        console.print(f"[green]✓[/] {track}")
+        progress.update(task_id, completed=state.done)
+        return
+
+    if (m := RX_FAIL.match(stripped)):
+        track = m.group(1).strip()
+        state.failed += 1
+        state.failed_tracks.append(track)
+        console.print(f"[red]✗[/] {track}")
+        progress.update(task_id, completed=state.done)
+        return
+
+    if RX_SKIP.search(stripped):
+        state.skipped += 1
+        console.print(f"[dim]·[/] {_short(stripped, 100)}")
+        progress.update(task_id, completed=state.done)
+        return
+
+
+def stream_subprocess(
+    cmd: Iterable[str], minimal: bool = False, initial_total: int | None = None
+) -> tuple[int, RunState]:
     state = RunState()
-    progress = Progress(
-        SpinnerColumn(style="magenta"),
-        TextColumn("[bold]{task.description}", justify="left"),
-        BarColumn(bar_width=None, complete_style="green", finished_style="bold green"),
-        MofNCompleteColumn(),
-        TextColumn("[dim]elapsed"),
-        TimeElapsedColumn(),
-        expand=True,
-    )
-    task_id = progress.add_task("downloading", total=None)
+    if initial_total is not None and initial_total > 0:
+        state.total = initial_total
 
     proc = subprocess.Popen(
         list(cmd),
@@ -509,13 +686,95 @@ def stream_subprocess(cmd: Iterable[str]) -> tuple[int, RunState]:
     signal.signal(signal.SIGTERM, _forward_signal)
     signal.signal(signal.SIGINT, _forward_signal)
 
-    with Live(make_layout(state, progress), console=console, refresh_per_second=8, screen=False) as live:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            parse_line(line, state, progress, task_id)
-            live.update(make_layout(state, progress))
+    if minimal:
+        progress = Progress(
+            TextColumn("[bold cyan]downloading"),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            expand=True,
+        )
+        task_id = progress.add_task("downloading", total=state.total)
+        with progress:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                parse_line_minimal(line, state, progress, task_id)
+    else:
+        progress = Progress(
+            SpinnerColumn(style="magenta"),
+            TextColumn("[bold]{task.description}", justify="left"),
+            BarColumn(bar_width=None, complete_style="green", finished_style="bold green"),
+            MofNCompleteColumn(),
+            TextColumn("[dim]elapsed"),
+            TimeElapsedColumn(),
+            expand=True,
+        )
+        task_id = progress.add_task("downloading", total=state.total)
+        with Live(make_layout(state, progress), console=console, refresh_per_second=8, screen=False) as live:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                parse_line(line, state, progress, task_id)
+                live.update(make_layout(state, progress))
 
     return proc.wait(), state
+
+
+def _title_only(track: str) -> str | None:
+    """Drop the leading ``Artist - `` from a sldl-formatted track string. sldl
+    splits on the first `` - `` to get artist/title, so we mirror that."""
+    if " - " not in track:
+        return None
+    title = track.split(" - ", 1)[1].strip()
+    return title or None
+
+
+def _build_retry_list(failed_tracks: list[str]) -> tuple[Path, list[str]] | None:
+    """Build a sldl ``--input-type=list`` file from failed tracks, keeping only
+    the title (no ``Artist -`` prefix). Returns the file path and the list of
+    queries, or None if nothing is retryable."""
+    titles: list[str] = []
+    seen: set[str] = set()
+    for track in failed_tracks:
+        title = _title_only(track)
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        titles.append(title)
+    if not titles:
+        return None
+    out = DATA_DIR / "youtube_title_retry.list"
+    lines = []
+    for t in titles:
+        escaped = t.replace('"', '\\"')
+        lines.append(f'"{escaped}"')
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out, titles
+
+
+def build_retry_command(cfg: Config, list_file: Path) -> list[str]:
+    cmd = [
+        "sldl",
+        str(list_file),
+        "--input-type", "list",
+        "--user", cfg.username,
+        "--pass", cfg.password,
+        "--path", str(DOWNLOADS_DIR),
+        "--pref-format", cfg.pref_format,
+        "--name-format", cfg.name_format,
+        "--concurrent-downloads", str(cfg.concurrent_downloads),
+        "--log-file", str(LOG_FILE),
+        "--index-path", str(INDEX_PATH),
+        "--no-progress",
+    ]
+    if cfg.strict_conditions:
+        cmd.append("--strict-conditions")
+    if cfg.fast_search:
+        cmd.append("--fast-search")
+    if cfg.write_playlist:
+        cmd.append("--write-playlist")
+    cmd.extend(cfg.extra_args)
+    return cmd
 
 
 def render_summary(state: RunState, exit_code: int) -> Panel:
@@ -540,38 +799,105 @@ def render_summary(state: RunState, exit_code: int) -> Panel:
 
 # ---------- Main -------------------------------------------------------------
 
+def _print_minimal_summary(state: RunState, exit_code: int) -> None:
+    label = "done" if exit_code == 0 else f"sldl exited with code {exit_code}"
+    style = "bold green" if exit_code == 0 else "bold red"
+    console.print(
+        f"[{style}]{label}.[/] "
+        f"[green]{state.succeeded} ok[/], "
+        f"[red]{state.failed} failed[/], "
+        f"[dim]{state.skipped} skipped[/]"
+    )
+
+
 def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-    cfg = load_config()
+    cli_url, minimal_cli = parse_cli(sys.argv[1:])
+    cfg = load_config(cli_url, minimal_cli)
 
-    console.print(render_banner())
-    console.print(render_config(cfg))
-    if cfg.generated_credentials:
+    if cfg.minimal:
+        cred_note = " (auto credentials)" if cfg.generated_credentials else ""
         console.print(
-            Panel(
-                Text(
-                    "No SLSK_USERNAME / SLSK_PASSWORD provided.\n"
-                    "A throwaway Soulseek identity has been generated.\n"
-                    f"Credentials saved to {CREDENTIALS_FILE} (mode 600).",
-                    style="yellow",
-                ),
-                border_style="yellow",
-                title="[bold]auto-generated credentials[/]",
-            )
+            f"[bold]gargantua:[/] {cfg.input_label} → "
+            f"{DOWNLOADS_DIR} ({cfg.pref_format}){cred_note}"
         )
-    console.rule("[bold magenta]running sldl[/]")
+    else:
+        console.print(render_banner())
+        console.print(render_config(cfg))
+        if cfg.generated_credentials:
+            console.print(
+                Panel(
+                    Text(
+                        "No SLSK_USERNAME / SLSK_PASSWORD provided.\n"
+                        "A throwaway Soulseek identity has been generated.\n"
+                        f"Credentials saved to {CREDENTIALS_FILE} (mode 600).",
+                        style="yellow",
+                    ),
+                    border_style="yellow",
+                    title="[bold]auto-generated credentials[/]",
+                )
+            )
+        console.rule("[bold magenta]running sldl[/]")
 
     cmd = build_command(cfg)
+    initial_total = 1 if cfg.input_type == "string" else None
     try:
-        exit_code, state = stream_subprocess(cmd)
+        exit_code, state = stream_subprocess(
+            cmd, minimal=cfg.minimal, initial_total=initial_total
+        )
     except FileNotFoundError:
         console.print("[red]error:[/] sldl binary is not on PATH inside the container.")
         return 127
 
-    console.rule("[bold magenta]done[/]")
-    console.print(render_summary(state, exit_code))
+    if cfg.minimal:
+        _print_minimal_summary(state, exit_code)
+    else:
+        console.rule("[bold magenta]done[/]")
+        console.print(render_summary(state, exit_code))
+
+    if (
+        env_bool("YOUTUBE_TITLE_FALLBACK", True)
+        and cfg.youtube_origin
+        and state.failed_tracks
+    ):
+        retry = _build_retry_list(state.failed_tracks)
+        if retry is not None:
+            list_file, titles = retry
+            if cfg.minimal:
+                console.print(f"[bold cyan]retry:[/] {len(titles)} track(s) by title only")
+            else:
+                console.rule(f"[bold magenta]retry: {len(titles)} track(s) by title only[/]")
+                console.print(
+                    Panel(
+                        Text(
+                            "Retrying failed YouTube tracks with the title only "
+                            "(no \"Artist -\" prefix).\n"
+                            f"Queries written to {list_file}.",
+                            style="cyan",
+                        ),
+                        border_style="cyan",
+                        title="[bold]title-only fallback[/]",
+                    )
+                )
+            try:
+                retry_exit, retry_state = stream_subprocess(
+                    build_retry_command(cfg, list_file), minimal=cfg.minimal
+                )
+            except FileNotFoundError:
+                console.print("[red]error:[/] sldl binary disappeared between runs.")
+                return 127
+            if cfg.minimal:
+                _print_minimal_summary(retry_state, retry_exit)
+            else:
+                console.rule("[bold magenta]retry done[/]")
+                console.print(render_summary(retry_state, retry_exit))
+            state.succeeded += retry_state.succeeded
+            state.failed = max(state.failed - retry_state.succeeded, 0)
+            if retry_exit != 0 and exit_code == 0:
+                exit_code = retry_exit
+
     return exit_code
 
 

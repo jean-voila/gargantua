@@ -10,6 +10,34 @@ terminal UI. Point it at a Spotify playlist (or a CSV) and it will pull every
 track in your preferred quality.
 
 
+## One-command run 
+
+Build once, then run with the playlist URL as a positional argument:
+
+```bash
+git clone git@github.com:jean-voila/FeurStagram.git && cd gargantua
+docker build -t gargantua .
+docker run --rm -it \
+  -v "$PWD/data:/data" \
+  -v "$PWD/downloads:/downloads" \
+  gargantua -m "https://www.youtube.com/playlist?list=<id>"
+```
+
+For Spotify URLs, add your credentials:
+
+```bash
+git clone git@github.com:jean-voila/FeurStagram.git && cd gargantua
+docker run --rm -it \
+  -e SPOTIFY_ID=... \
+  -e SPOTIFY_SECRET=... \
+  -v "$PWD/data:/data" \
+  -v "$PWD/downloads:/downloads" \
+  gargantua "https://open.spotify.com/playlist/<id>"
+```
+
+Downloads land in `./downloads`; logs and the sldl index in `./data`.
+
+
 
 ## Highlights
 
@@ -37,7 +65,6 @@ cd gargantua
 docker compose up --build
 ```
 
-Downloads land in `./downloads`; logs and the sldl index in `./data`.
 
 ## Configuration
 
@@ -57,7 +84,7 @@ When credentials are auto-generated they are written to `/data/credentials.txt`
 
 | Variable        | Description                                                      |
 | --------------- | ---------------------------------------------------------------- |
-| `PLAYLIST_URL`  | Spotify, YouTube, Bandcamp or MusicBrainz playlist URL. sldl auto-detects the type. |
+| `PLAYLIST_URL`  | Spotify, YouTube, Bandcamp or MusicBrainz playlist URL — or a single YouTube video URL (`watch?v=`, `youtu.be/<id>`, `shorts/<id>`), in which case yt-dlp fetches the title and passes it to sldl as a search query. sldl auto-detects the type. |
 | `TXT_FILENAME`  | Plain text file in `/data`, **one search query per line**. Falls back to `playlist.txt` then to the first `*.txt` found. Lines starting with `#` are comments. Prefix `a:` for an album download. Gargantua wraps each line in quotes and feeds it to sldl as a `--input-type=list`. |
 | `CSV_FILENAME`  | CSV file in `/data`. Falls back to `playlist.csv` then to the first `*.csv` found. |
 | `SPOTIFY_ID` / `SPOTIFY_SECRET` | Spotify API client credentials. **Required for Spotify URLs** since Spotify deprecated anonymous playlist access in 2024 (free, from [developer.spotify.com](https://developer.spotify.com)). |
@@ -85,6 +112,8 @@ https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | `STRICT_CONDITIONS`    | `false`                          | `--strict-conditions`     |
 | `FAST_SEARCH`          | `true`                           | `--fast-search`           |
 | `WRITE_PLAYLIST`       | `true`                           | `--write-playlist`        |
+| `YOUTUBE_TITLE_FALLBACK` | `true`                         | (gargantua-side) for YouTube playlists, retries any track that wasn't found using just the video title — without the `Artist -` prefix that sldl extracts from the video name. |
+| `MINIMAL`              | `false`                          | (gargantua-side) terse output: a single startup line, one progress bar, one line per completed track, one summary line. No banners, panels, or rules. Equivalent to `-m` / `--minimal` on the CLI. |
 | `SLDL_EXTRA_ARGS`      | *(empty)*                        | passed verbatim to sldl   |
 
 `STRICT_CONDITIONS`, `FAST_SEARCH` and `WRITE_PLAYLIST` accept any of

@@ -30,7 +30,7 @@ RUN curl -fsSL "${SLDL_URL}" -o /tmp/sldl.zip && \
     rm /tmp/sldl.zip && \
     sldl --help >/dev/null
 
-RUN pip install --no-cache-dir 'rich==13.9.4'
+RUN pip install --no-cache-dir 'rich==13.9.4' 'yt-dlp>=2024.11.18'
 
 RUN mkdir -p /data /downloads
 
