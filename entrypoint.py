@@ -472,7 +472,9 @@ def _build_resolved_list(titles: list[str]) -> tuple[Path, int, int]:
                 mb_hits += 1
             else:
                 fallback += 1
-            escaped = query.replace('"', '\\"')
+            # sldl's .list parser doesn't support escaped quotes — every `"`
+            # toggles its quoted state — so strip them instead of escaping.
+            escaped = query.replace('"', "'")
             lines.append(f'"{escaped}"')
             progress.update(task_id, advance=1)
 
@@ -502,7 +504,7 @@ def _txt_to_list_file(src: Path) -> Path:
         if stripped.startswith('"'):
             lines.append(f"{prefix}{stripped}")
         else:
-            escaped = stripped.replace('"', '\\"')
+            escaped = stripped.replace('"', "'")
             lines.append(f'{prefix}"{escaped}"')
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
